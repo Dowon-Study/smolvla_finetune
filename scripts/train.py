@@ -391,7 +391,10 @@ def main():
                 max_length=64,
                 truncation=True
             )
+            # 텐서를 현재 학습 중인 GPU 장치로 이동
             batch["observation.language.tokens"] = text_inputs["input_ids"].to(device)
+            # ⭐ [여기 추가!] 어텐션 마스크도 같이 넘겨줍니다.
+            batch["observation.language.attention_mask"] = text_inputs["attention_mask"].to(device)
 
         t0 = time.perf_counter()
 
