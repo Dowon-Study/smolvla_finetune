@@ -338,7 +338,7 @@ def main():
     if is_main:
         print("\n[4/5] 토크나이저 준비...")
     # 텍스트 처리를 위한 토크나이저 미리 로드
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=False)
 
     if is_main:
         print("\n[5/5] Accelerator 래핑...")
