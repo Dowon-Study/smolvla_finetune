@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-train.py — SmolVLA LoRA 파인튜닝 (상세 로깅)
-=============================================
+train.py — SmolVLA 파인튜닝 (VLM 동결 + Action Expert만 학습)
+================================================================
 
 실행 (단일 GPU):
     conda activate smolvla
@@ -9,9 +9,6 @@ train.py — SmolVLA LoRA 파인튜닝 (상세 로깅)
 
 실행 (4-GPU DDP):
     accelerate launch --num_processes=4 scripts/train.py
-
-주요 옵션:
-    --steps 20000 --batch_size 8 --lr 2e-5 --lora_r 16
 """
 
 import argparse
@@ -24,7 +21,7 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer # 추가된 임포트
+from transformers import AutoTokenizer
 
 
 # ── 인자 파싱 ────────────────────────────────────────────────────────────────
@@ -41,7 +38,7 @@ def parse_args():
     p.add_argument("--batch_size",   type=int,   default=8,
                    help="GPU당 배치 크기 (3080 10GB → 8 권장)")
     p.add_argument("--lr",           type=float, default=2e-5,
-                   help="학습률 (파인튜닝은 낮게: 1e-5 ~ 5e-5)")
+                   help="학습률")
     p.add_argument("--warmup_steps", type=int,   default=500,
                    help="LR 워밍업 스텝 수")
     p.add_argument("--grad_clip",    type=float, default=1.0,
@@ -51,10 +48,6 @@ def parse_args():
     p.add_argument("--log_freq",     type=int,   default=20,
                    help="콘솔 출력 주기 (스텝)")
     p.add_argument("--num_workers",  type=int,   default=4)
-    p.add_argument("--lora_r",       type=int,   default=16,
-                   help="LoRA rank (줄이면 VRAM 절약)")
-    p.add_argument("--lora_alpha",   type=int,   default=None,
-                   help="LoRA alpha (기본: lora_r * 2)")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--resume",       action="store_true",
                    help="이전 체크포인트에서 재시작")
@@ -67,26 +60,27 @@ def parse_args():
 
 def load_policy(args, device):
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    from peft import LoraConfig, get_peft_model
 
     print(f"  사전학습 모델 로드: {args.pretrained}")
     policy = SmolVLAPolicy.from_pretrained(args.pretrained)
 
-    lora_alpha = args.lora_alpha or args.lora_r * 2
-    lora_cfg = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=lora_alpha,
-        target_modules="all-linear",
-        lora_dropout=0.05,
-        bias="none",
-    )
-    policy = get_peft_model(policy, lora_cfg)
+    # ==========================================
+    # ⭐ VLM 동결 및 Action Expert만 학습 설정
+    # ==========================================
+    # 1. 모델의 모든 파라미터를 먼저 동결(Freeze)
+    for param in policy.parameters():
+        param.requires_grad = False
+
+    # 2. 이름에 'action_head'나 'action_expert'가 포함된 파라미터만 압축 해제
+    for name, param in policy.named_parameters():
+        if "action_head" in name or "action_expert" in name:
+            param.requires_grad = True
 
     total   = sum(p.numel() for p in policy.parameters())
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"  전체 파라미터  : {total/1e6:.1f}M")
-    print(f"  학습 파라미터  : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
-    print(f"  LoRA rank={args.lora_r}  alpha={lora_alpha}")
+    print(f"  학습 파라미터(Action만) : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
+    print(f"  ★ VLM 백본은 동결되었으며, Action Expert만 Full Fine-tuning 됩니다.")
 
     return policy.to(device)
 
@@ -146,7 +140,6 @@ class TrainLogger:
         self.num_gpus    = num_gpus
         self.log_path    = output_dir / "train_log.jsonl"
 
-        # 이동 평균 윈도우
         self.loss_window     = deque(maxlen=100)
         self.grad_window     = deque(maxlen=100)
         self.step_time_window = deque(maxlen=50)
@@ -154,7 +147,6 @@ class TrainLogger:
         self.best_loss   = float("inf")
         self.start_time  = time.time()
 
-        # WandB
         self.wandb = None
         if use_wandb:
             try:
@@ -181,19 +173,16 @@ class TrainLogger:
         if loss < self.best_loss:
             self.best_loss = loss
 
-        # 남은 시간 추정
         remaining = (self.total_steps - step) * avg_step_t
         h, m = divmod(int(remaining), 3600)
         m, s  = divmod(m, 60)
         eta   = f"{h:02d}:{m:02d}:{s:02d}"
 
-        # 경과 시간
         elapsed = time.time() - self.start_time
         eh, em  = divmod(int(elapsed), 3600)
         em, es  = divmod(em, 60)
         elapsed_str = f"{eh:02d}:{em:02d}:{es:02d}"
 
-        # 샘플/초
         samples_per_sec = self.batch_size * self.num_gpus / max(avg_step_t, 1e-6)
 
         record = {
@@ -212,11 +201,9 @@ class TrainLogger:
         if extra:
             record.update(extra)
 
-        # JSONL 저장
         with open(self.log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-        # WandB
         if self.wandb:
             self.wandb.log(record, step=step)
 
@@ -240,7 +227,6 @@ class TrainLogger:
         )
 
     def print_milestone(self, step: int, record: dict):
-        """save_freq마다 한 줄 요약 출력"""
         print(f"\n{'─'*80}")
         print(
             f"  ★ step {step:>6}/{self.total_steps}"
@@ -265,9 +251,9 @@ def save_checkpoint(step: int, policy, optimizer, scheduler,
     ckpt_dir = output_dir / f"checkpoint_{step:07d}"
     accelerator.save_state(str(ckpt_dir))
 
-    # LoRA 어댑터 별도 저장 (추론 편의)
+    # 전체 모델 저장 (동결된 VLM + 학습된 Action Head)
     unwrapped = accelerator.unwrap_model(policy)
-    unwrapped.save_pretrained(str(ckpt_dir / "lora_adapter"))
+    unwrapped.save_pretrained(str(ckpt_dir / "policy_model"))
 
     # 최신 체크포인트 링크 업데이트
     link = output_dir / "checkpoint_latest"
@@ -299,7 +285,6 @@ def load_latest_checkpoint(output_dir: Path, policy, optimizer, scheduler,
 def main():
     args = parse_args()
 
-    lora_alpha = args.lora_alpha or args.lora_r * 2
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -313,11 +298,10 @@ def main():
 
     if is_main:
         print("=" * 80)
-        print("  SmolVLA 파인튜닝")
+        print("  SmolVLA 파인튜닝 (Action Expert만 학습)")
         print(f"  GPU {num_gpus}개  |  device={device}  |  mixed_precision=bf16")
         print(f"  batch_size={args.batch_size}/GPU  →  유효 배치={args.batch_size * num_gpus}")
         print(f"  steps={args.steps}  lr={args.lr}  warmup={args.warmup_steps}")
-        print(f"  LoRA rank={args.lora_r}  alpha={lora_alpha}")
         print(f"  출력: {output_dir}")
         print("=" * 80)
 
@@ -337,7 +321,7 @@ def main():
     
     if is_main:
         print("\n[4/5] 토크나이저 준비...")
-    # 텍스트 처리를 위한 토크나이저 미리 로드
+    # 텍스트 처리를 위한 토크나이저 미리 로드 (Fast tokenizer 비활성화로 안정성 확보)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=False)
 
     if is_main:
@@ -389,7 +373,7 @@ def main():
             batch = next(data_iter)
             
         # ====================================================================
-        # ⭐ [오류 해결 코드] Task 텍스트를 토큰화하여 배치에 추가
+        # ⭐ Task 텍스트를 토큰화하여 배치에 추가
         # ====================================================================
         if "observation.language.tokens" not in batch and "task" in batch:
             text_inputs = tokenizer(
@@ -427,6 +411,7 @@ def main():
 
         # ── 로깅 ─────────────────────────────────────────────────────────────
         if is_main:
+            # lr 인덱스 버그 수정 완료
             lr  = optimizer.param_groups["lr"]
             extra = {k: round(float(v), 5) for k, v in loss_dict.items()
                      if k != "loss"}
@@ -472,10 +457,10 @@ def main():
         print(f"  출력 경로 : {output_dir}")
         print(f"{'='*80}")
 
-        # 최종 LoRA 어댑터 저장
-        final_dir = output_dir / "final_lora"
+        # 최종 모델 전체 저장
+        final_dir = output_dir / "final_policy"
         accelerator.unwrap_model(policy).save_pretrained(str(final_dir))
-        print(f"  최종 LoRA : {final_dir}")
+        print(f"  최종 모델 : {final_dir}")
 
         logger.close()
 
