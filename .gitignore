@@ -1,0 +1,18 @@
+# 데이터 (용량 크므로 git 제외)
+data/
+outputs/
+LIBERO/
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+*.hdf5
+*.pkl
+
+# 로그
+*.log
+wandb/
+
+# IDE
+.vscode/
+.idea/
