@@ -38,12 +38,12 @@ def main():
 
     features = {
         "observation.images.image": {
-            "dtype": "video",
+            "dtype": "image",
             "shape": (256, 256, 3),
             "names": ["height", "width", "channel"],
         },
         "observation.images.image2": {
-            "dtype": "video",
+            "dtype": "image",
             "shape": (256, 256, 3),
             "names": ["height", "width", "channel"],
         },
@@ -68,7 +68,7 @@ def main():
         features=features,
         root=output_root,
         robot_type="panda",
-        use_videos=True,
+        use_videos=False,
         image_writer_threads=4,
     )
 

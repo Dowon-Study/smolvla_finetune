@@ -24,6 +24,7 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import AutoTokenizer # 추가된 임포트
 
 
 # ── 인자 파싱 ────────────────────────────────────────────────────────────────
@@ -322,20 +323,25 @@ def main():
 
     # ── 컴포넌트 초기화 ──────────────────────────────────────────────────────
     if is_main:
-        print("\n[1/4] 모델 로드...")
+        print("\n[1/5] 모델 로드...")
     policy = load_policy(args, device)
 
     if is_main:
-        print("\n[2/4] 데이터셋 로드...")
+        print("\n[2/5] 데이터셋 로드...")
     dataset    = load_dataset(args)
     dataloader = make_dataloader(dataset, args)
 
     if is_main:
-        print("\n[3/4] 옵티마이저 설정...")
+        print("\n[3/5] 옵티마이저 설정...")
     optimizer, scheduler = make_optimizer_scheduler(policy, args, args.steps)
+    
+    if is_main:
+        print("\n[4/5] 토크나이저 준비...")
+    # 텍스트 처리를 위한 토크나이저 미리 로드
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
 
     if is_main:
-        print("\n[4/4] Accelerator 래핑...")
+        print("\n[5/5] Accelerator 래핑...")
     policy, optimizer, dataloader, scheduler = accelerator.prepare(
         policy, optimizer, dataloader, scheduler
     )
@@ -381,6 +387,21 @@ def main():
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
+            
+        # ====================================================================
+        # ⭐ [오류 해결 코드] Task 텍스트를 토큰화하여 배치에 추가
+        # ====================================================================
+        if "observation.language.tokens" not in batch and "task" in batch:
+            text_inputs = tokenizer(
+                batch["task"],
+                return_tensors="pt",
+                padding="max_length",
+                max_length=64,
+                truncation=True
+            )
+            # 텐서를 현재 학습 중인 GPU 장치로 이동
+            batch["observation.language.tokens"] = text_inputs["input_ids"].to(device)
+        # ====================================================================
 
         t0 = time.perf_counter()
 
@@ -406,7 +427,7 @@ def main():
 
         # ── 로깅 ─────────────────────────────────────────────────────────────
         if is_main:
-            lr  = optimizer.param_groups[0]["lr"]
+            lr  = optimizer.param_groups["lr"]
             extra = {k: round(float(v), 5) for k, v in loss_dict.items()
                      if k != "loss"}
             record = logger.log_step(
