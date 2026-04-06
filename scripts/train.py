@@ -103,17 +103,10 @@ def load_dataset(args):
 
 
 def make_dataloader(dataset, args):
-    from lerobot.datasets.sampler import EpisodeAwareSampler
-
-    sampler = EpisodeAwareSampler(
-        dataset.episode_data_index,
-        drop_last_n=0,
-        shuffle=True,
-    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
