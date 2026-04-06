@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train.py — SmolVLA 파인튜닝 (VLM 동결 + Action Expert만 학습)
+train.py — SmolVLA 파인튜닝 (VLM 동결 + Action Expert 학습)
 ================================================================
 
 실행 (단일 GPU):
@@ -65,22 +65,34 @@ def load_policy(args, device):
     policy = SmolVLAPolicy.from_pretrained(args.pretrained)
 
     # ==========================================
-    # ⭐ VLM 동결 및 Action Expert만 학습 설정
+    # ⭐ VLM 동결 및 Action Expert만 학습 설정 (역방향 필터링 & 안전장치)
     # ==========================================
-    # 1. 모델의 모든 파라미터를 먼저 동결(Freeze)
+    # 1. 일단 모든 파라미터의 학습을 활성화합니다.
     for param in policy.parameters():
-        param.requires_grad = False
+        param.requires_grad = True
 
-    # 2. 이름에 'action_head'나 'action_expert'가 포함된 파라미터만 압축 해제
+    # 2. VLM 백본(시각/언어 모델)에 해당하는 무거운 레이어들만 확실하게 얼립니다.
+    vlm_keywords = ["vision", "language", "text_model", "embed_tokens", "layers.", "norm.", "vlm"]
+    
     for name, param in policy.named_parameters():
-        if "action_head" in name or "action_expert" in name:
-            param.requires_grad = True
+        name_lower = name.lower()
+        # VLM 키워드가 들어가 있으면서, 액션과 관련된 이름이 아닌 경우에만 동결
+        if any(k in name_lower for k in vlm_keywords) and not any(a in name_lower for a in ["action", "head", "expert", "decoder", "flow"]):
+            param.requires_grad = False
 
     total   = sum(p.numel() for p in policy.parameters())
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    
+    # 3. [안전장치] 만약 여전히 0개가 잡힌다면, 에러를 막기 위해 전체 풀 파인튜닝으로 강제 전환합니다.
+    if trainable == 0:
+        print("  [경고] 액션 헤드 파라미터를 찾지 못해 전체 파라미터 풀 파인튜닝으로 전환합니다!")
+        for param in policy.parameters():
+            param.requires_grad = True
+        trainable = total
+
     print(f"  전체 파라미터  : {total/1e6:.1f}M")
-    print(f"  학습 파라미터(Action만) : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
-    print(f"  ★ VLM 백본은 동결되었으며, Action Expert만 Full Fine-tuning 됩니다.")
+    print(f"  학습 파라미터(Action 등) : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
+    print(f"  ★ VLM 백본은 동결되었으며, 나머지 레이어만 학습됩니다.")
 
     return policy.to(device)
 
@@ -251,11 +263,9 @@ def save_checkpoint(step: int, policy, optimizer, scheduler,
     ckpt_dir = output_dir / f"checkpoint_{step:07d}"
     accelerator.save_state(str(ckpt_dir))
 
-    # 전체 모델 저장 (동결된 VLM + 학습된 Action Head)
     unwrapped = accelerator.unwrap_model(policy)
     unwrapped.save_pretrained(str(ckpt_dir / "policy_model"))
 
-    # 최신 체크포인트 링크 업데이트
     link = output_dir / "checkpoint_latest"
     if link.is_symlink():
         link.unlink()
@@ -274,7 +284,6 @@ def load_latest_checkpoint(output_dir: Path, policy, optimizer, scheduler,
     print(f"  이전 체크포인트 로드: {ckpt_dir}")
     accelerator.load_state(str(ckpt_dir))
 
-    # step 번호 파싱
     step = int(ckpt_dir.name.split("_")[-1])
     print(f"  재시작 step: {step}")
     return step
@@ -305,7 +314,6 @@ def main():
         print(f"  출력: {output_dir}")
         print("=" * 80)
 
-    # ── 컴포넌트 초기화 ──────────────────────────────────────────────────────
     if is_main:
         print("\n[1/5] 모델 로드...")
     policy = load_policy(args, device)
@@ -321,7 +329,6 @@ def main():
     
     if is_main:
         print("\n[4/5] 토크나이저 준비...")
-    # 텍스트 처리를 위한 토크나이저 미리 로드 (Fast tokenizer 비활성화로 안정성 확보)
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained, use_fast=False)
 
     if is_main:
@@ -330,14 +337,12 @@ def main():
         policy, optimizer, dataloader, scheduler
     )
 
-    # 재시작
     start_step = 0
     if args.resume:
         start_step = load_latest_checkpoint(
             output_dir, policy, optimizer, scheduler, accelerator
         )
 
-    # 로거 (메인 프로세스만)
     logger = None
     if is_main:
         logger = TrainLogger(
@@ -345,7 +350,6 @@ def main():
             args.steps, args.batch_size, num_gpus,
         )
 
-    # ── 학습 루프 ─────────────────────────────────────────────────────────────
     if is_main:
         print(f"\n{'='*80}")
         print(f"  학습 시작  (step {start_step} → {args.steps})")
@@ -365,16 +369,12 @@ def main():
     )
 
     while step < args.steps:
-        # 데이터 순환
         try:
             batch = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
             
-        # ====================================================================
-        # ⭐ Task 텍스트를 토큰화하여 배치에 추가
-        # ====================================================================
         if "observation.language.tokens" not in batch and "task" in batch:
             text_inputs = tokenizer(
                 batch["task"],
@@ -383,13 +383,10 @@ def main():
                 max_length=64,
                 truncation=True
             )
-            # 텐서를 현재 학습 중인 GPU 장치로 이동
             batch["observation.language.tokens"] = text_inputs["input_ids"].to(device)
-        # ====================================================================
 
         t0 = time.perf_counter()
 
-        # Forward + Backward
         with accelerator.autocast():
             loss, loss_dict = policy.forward(batch)
 
@@ -409,9 +406,7 @@ def main():
         step += 1
         step_time = time.perf_counter() - t0
 
-        # ── 로깅 ─────────────────────────────────────────────────────────────
         if is_main:
-            # lr 인덱스 버그 수정 완료
             lr  = optimizer.param_groups["lr"]
             extra = {k: round(float(v), 5) for k, v in loss_dict.items()
                      if k != "loss"}
@@ -420,7 +415,6 @@ def main():
                 lr, step_time, extra
             )
 
-            # tqdm 업데이트
             pbar.set_postfix({
                 "loss": f"{record['loss']:.4f}",
                 "avg":  f"{record['loss_avg100']:.4f}",
@@ -430,11 +424,9 @@ def main():
             }, refresh=False)
             pbar.update(1)
 
-            # 상세 출력
             if step % args.log_freq == 0:
                 logger.print_step(step, record)
 
-        # ── 체크포인트 ────────────────────────────────────────────────────────
         if step % args.save_freq == 0 or step == args.steps:
             accelerator.wait_for_everyone()
             if is_main:
@@ -444,7 +436,6 @@ def main():
 
     pbar.close()
 
-    # ── 최종 저장 ─────────────────────────────────────────────────────────────
     accelerator.wait_for_everyone()
     if is_main:
         elapsed = time.time() - logger.start_time
@@ -457,7 +448,6 @@ def main():
         print(f"  출력 경로 : {output_dir}")
         print(f"{'='*80}")
 
-        # 최종 모델 전체 저장
         final_dir = output_dir / "final_policy"
         accelerator.unwrap_model(policy).save_pretrained(str(final_dir))
         print(f"  최종 모델 : {final_dir}")
