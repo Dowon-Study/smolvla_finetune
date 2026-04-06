@@ -329,16 +329,17 @@ def main():
     
 
     if is_main:
-        print("\n[4/5] 토크나이저 준비 (Qwen2 우회 로드)...")
-    try:
-        # 1. 꼬임 없는 Qwen2 토크나이저를 Fast 모드로 직접 가져옵니다.
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
-    except Exception as e:
-        if is_main:
-            print(f"  [경고] Qwen 토크나이저 로드 실패, 기본값 시도: {e}")
-        # 2. 최후의 수단으로 원래 모델을 시도합니다.
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
+        print("\n[4/5] 토크나이저 준비...")
+    
+    # ⭐ SmolVLA의 진짜 백본인 SmolVLM2의 공식 토크나이저를 가져옵니다.
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Instruct")
+    
+    # 텍스트 길이를 맞출 때(Padding) 쓸 빈칸 토큰이 없다면 설정해줍니다.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
+
+        
     if is_main:
         print("\n[5/5] Accelerator 래핑...")
     policy, optimizer, dataloader, scheduler = accelerator.prepare(
