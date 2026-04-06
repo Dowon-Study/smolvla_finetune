@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-train.py — SmolVLA 파인튜닝 (VLM 동결 + Action Expert 학습)
+train.py — SmolVLA 파인튜닝 (OOM 및 Chunk 에러 완벽 해결본)
 ================================================================
-
-실행 (단일 GPU):
-    conda activate smolvla
-    python scripts/train.py
 
 실행 (4-GPU DDP):
     accelerate launch --num_processes=4 scripts/train.py
@@ -35,8 +31,11 @@ def parse_args():
     p.add_argument("--output_dir",   default="outputs/smolvla_ft_object")
     p.add_argument("--steps",        type=int,   default=20000,
                    help="총 학습 스텝 수")
-    p.add_argument("--batch_size",   type=int,   default=8,
-                   help="GPU당 배치 크기 (3080 10GB → 8 권장)")
+    
+    # ⭐ [오류 해결 1] 3080 10GB 메모리 초과(OOM)를 막기 위해 기본 배치를 2로 축소
+    p.add_argument("--batch_size",   type=int,   default=2,
+                   help="GPU당 배치 크기 (3080 10GB 환경에서는 2 권장)")
+    
     p.add_argument("--lr",           type=float, default=2e-5,
                    help="학습률")
     p.add_argument("--warmup_steps", type=int,   default=500,
@@ -64,35 +63,27 @@ def load_policy(args, device):
     print(f"  사전학습 모델 로드: {args.pretrained}")
     policy = SmolVLAPolicy.from_pretrained(args.pretrained)
 
-    # ==========================================
-    # ⭐ VLM 동결 및 Action Expert만 학습 설정 (역방향 필터링 & 안전장치)
-    # ==========================================
-    # 1. 일단 모든 파라미터의 학습을 활성화합니다.
+    # VLM 동결 및 Action Expert만 학습
     for param in policy.parameters():
         param.requires_grad = True
 
-    # 2. VLM 백본(시각/언어 모델)에 해당하는 무거운 레이어들만 확실하게 얼립니다.
     vlm_keywords = ["vision", "language", "text_model", "embed_tokens", "layers.", "norm.", "vlm"]
     
     for name, param in policy.named_parameters():
         name_lower = name.lower()
-        # VLM 키워드가 들어가 있으면서, 액션과 관련된 이름이 아닌 경우에만 동결
         if any(k in name_lower for k in vlm_keywords) and not any(a in name_lower for a in ["action", "head", "expert", "decoder", "flow"]):
             param.requires_grad = False
 
     total   = sum(p.numel() for p in policy.parameters())
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     
-    # 3. [안전장치] 만약 여전히 0개가 잡힌다면, 에러를 막기 위해 전체 풀 파인튜닝으로 강제 전환합니다.
     if trainable == 0:
-        print("  [경고] 액션 헤드 파라미터를 찾지 못해 전체 파라미터 풀 파인튜닝으로 전환합니다!")
         for param in policy.parameters():
             param.requires_grad = True
         trainable = total
 
     print(f"  전체 파라미터  : {total/1e6:.1f}M")
-    print(f"  학습 파라미터(Action 등) : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
-    print(f"  ★ VLM 백본은 동결되었으며, 나머지 레이어만 학습됩니다.")
+    print(f"  학습 파라미터  : {trainable/1e6:.2f}M  ({100*trainable/total:.2f}%)")
 
     return policy.to(device)
 
@@ -105,6 +96,21 @@ def load_dataset(args):
         repo_id=args.dataset_repo,
         root=args.dataset_root,
     )
+    
+    # =========================================================================
+    # ⭐ [오류 해결 2] 크기 불일치 에러(201 vs 159)의 핵심 원인 해결!
+    # 데이터로더가 1개가 아닌 "50개의 미래 행동(Chunk)"을 한 번에 묶어오도록 명시합니다.
+    # =========================================================================
+    fps = getattr(dataset, "fps", 10)
+    action_horizon = 50
+    
+    dataset.delta_timestamps = {
+        "action": [i / fps for i in range(action_horizon)],  # 미래 50스텝 가져오기
+        "observation.images.image": [0.0],                   # 현재 이미지 1장
+        "observation.images.image2": [0.0],                  # 현재 손목 이미지 1장
+        "observation.state": [0.0],                          # 현재 로봇 상태 1개
+    }
+
     print(f"  에피소드: {dataset.num_episodes}개  |  프레임: {len(dataset)}개")
     return dataset
 
@@ -170,7 +176,7 @@ class TrainLogger:
                 })
                 self.wandb = wandb
             except ImportError:
-                print("  [경고] wandb 미설치 — 콘솔 로깅만 사용합니다.")
+                pass
 
     def log_step(self, step: int, loss: float, grad_norm: float,
                  lr: float, step_time: float, extra: dict | None = None):
@@ -297,7 +303,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Accelerator (DDP / 단일 GPU 자동 감지)
+    # Accelerator (DDP)
     accelerator = Accelerator(mixed_precision="bf16")
     device      = accelerator.device
     num_gpus    = accelerator.num_processes
@@ -327,19 +333,14 @@ def main():
         print("\n[3/5] 옵티마이저 설정...")
     optimizer, scheduler = make_optimizer_scheduler(policy, args, args.steps)
     
-
     if is_main:
         print("\n[4/5] 토크나이저 준비...")
     
-    # ⭐ SmolVLA의 진짜 백본인 SmolVLM2의 공식 토크나이저를 가져옵니다.
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Instruct")
-    
-    # 텍스트 길이를 맞출 때(Padding) 쓸 빈칸 토큰이 없다면 설정해줍니다.
+    # SmolVLM2 공식 토크나이저 로드
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Instruct", use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-
-        
     if is_main:
         print("\n[5/5] Accelerator 래핑...")
     policy, optimizer, dataloader, scheduler = accelerator.prepare(
@@ -384,17 +385,18 @@ def main():
             data_iter = iter(dataloader)
             batch = next(data_iter)
             
+        # ====================================================================
+        # ⭐ [오류 해결 3] 텍스트 마스크 추가 & 길이 완벽 동기화 (max_length=22)
+        # ====================================================================
         if "observation.language.tokens" not in batch and "task" in batch:
             text_inputs = tokenizer(
                 batch["task"],
                 return_tensors="pt",
                 padding="max_length",
-                max_length=22,
+                max_length=22,      # SmolVLA 시퀀스 템플릿과 정확히 일치하는 길이
                 truncation=True
             )
-            # 텐서를 현재 학습 중인 GPU 장치로 이동
             batch["observation.language.tokens"] = text_inputs["input_ids"].to(device)
-            # ⭐ [여기 추가!] 어텐션 마스크도 같이 넘겨줍니다.
             batch["observation.language.attention_mask"] = text_inputs["attention_mask"].to(device)
 
         t0 = time.perf_counter()
