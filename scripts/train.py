@@ -389,7 +389,7 @@ def main():
                 batch["task"],
                 return_tensors="pt",
                 padding="max_length",
-                max_length=64,
+                max_length=22,
                 truncation=True
             )
             # 텐서를 현재 학습 중인 GPU 장치로 이동
