@@ -92,25 +92,23 @@ def load_dataset(args):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     print(f"  데이터셋 로드: {args.dataset_repo}  (root={args.dataset_root})")
+
+    # ⭐ [최종 해결책] 데이터셋을 "생성하는 시점"에 50스텝을 요구하도록 강제합니다.
+    # 에피소드가 20스텝이더라도, LeRobot이 자동으로 마지막 프레임으로 나머지를 패딩해줍니다.
+    action_horizon = 50
+    fps = 10.0
+
     dataset = LeRobotDataset(
         repo_id=args.dataset_repo,
         root=args.dataset_root,
+        delta_timestamps={
+            "action": [i / fps for i in range(action_horizon)],
+            "observation.images.image": [0.0],
+            "observation.images.image2": [0.0],
+            "observation.state": [0.0],
+        }
     )
     
-    # =========================================================================
-    # ⭐ [오류 해결 2] 크기 불일치 에러(201 vs 159)의 핵심 원인 해결!
-    # 데이터로더가 1개가 아닌 "50개의 미래 행동(Chunk)"을 한 번에 묶어오도록 명시합니다.
-    # =========================================================================
-    fps = getattr(dataset, "fps", 10)
-    action_horizon = 50
-    
-    dataset.delta_timestamps = {
-        "action": [i / fps for i in range(action_horizon)],  # 미래 50스텝 가져오기
-        "observation.images.image": [0.0],                   # 현재 이미지 1장
-        "observation.images.image2": [0.0],                  # 현재 손목 이미지 1장
-        "observation.state": [0.0],                          # 현재 로봇 상태 1개
-    }
-
     print(f"  에피소드: {dataset.num_episodes}개  |  프레임: {len(dataset)}개")
     return dataset
 
