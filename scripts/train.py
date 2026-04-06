@@ -395,8 +395,8 @@ def main():
                 truncation=True
             )
             batch["observation.language.tokens"] = text_inputs["input_ids"].to(device)
-            batch["observation.language.attention_mask"] = text_inputs["attention_mask"].to(device)
-
+            # ⭐ .bool()을 추가해서 True/False 타입으로 강제 변환해 줍니다!
+            batch["observation.language.attention_mask"] = text_inputs["attention_mask"].bool().to(device)
         t0 = time.perf_counter()
 
         with accelerator.autocast():
