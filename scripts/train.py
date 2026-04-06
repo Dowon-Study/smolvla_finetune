@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-train.py — SmolVLA 파인튜닝 (최종 안정화 버전 - 튜플 에러 해결)
-================================================================
+train.py — SmolVLA 파인튜닝 (최종 안정화 버전)
+=============================================
 """
 
 import argparse
@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument("--pretrained",   default="HuggingFaceVLA/smolvla_libero")
     p.add_argument("--output_dir",   default="outputs/smolvla_ft_object")
     p.add_argument("--steps",        type=int,   default=20000)
-    p.add_argument("--batch_size",   type=int,   default=1)  # 10GB VRAM 최적화
+    p.add_argument("--batch_size",   type=int,   default=1) 
     p.add_argument("--lr",           type=float, default=2e-5)
     p.add_argument("--save_freq",    type=int,   default=2000)
     p.add_argument("--seed",         type=int,   default=42)
@@ -51,9 +51,9 @@ def load_policy(args, device):
         if any(key in name for key in ["action_head", "diffusion_model", "action_expert"]):
             param.requires_grad = True
 
-    # 3. 안전장치
-    trainable_count = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    if trainable_count == 0:
+    # 3. 안전장치: 아무것도 안 잡히면 VLM 제외 모두 학습
+    trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    if trainable == 0:
         for name, param in policy.named_parameters():
             if "vlm" not in name.lower():
                 param.requires_grad = True
@@ -91,7 +91,7 @@ class TrainLogger:
                 import wandb
                 wandb.init(project="smolvla_finetune")
                 self.wandb = wandb
-            except ImportError: pass
+            except: pass
 
     def log(self, step, loss, lr, step_time):
         self.loss_window.append(loss)
@@ -115,7 +115,7 @@ def main():
     device, is_main = accelerator.device, accelerator.is_main_process
     torch.manual_seed(args.seed + accelerator.process_index)
 
-    # 1. 모델 / 데이터
+    # 1. 컴포넌트 초기화
     policy = load_policy(args, device)
     dataset = load_dataset(args)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
@@ -128,11 +128,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM2-500M-Instruct", use_fast=False)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. 가속기 준비
+    # 2. Accelerator 준비
     policy, optimizer, dataloader, scheduler = accelerator.prepare(policy, optimizer, dataloader, scheduler)
     logger = TrainLogger(output_dir, args.wandb, args.steps) if is_main else None
 
-    # 3. 학습 시작
+    # 3. 학습 루프
     policy.train()
     data_iter = iter(dataloader)
     pbar = tqdm(total=args.steps, desc="학습", disable=not is_main)
@@ -148,28 +148,30 @@ def main():
 
         t0 = time.perf_counter()
         with accelerator.autocast():
-            # ⭐ [중요 수정] 반환 형식이 튜플이든 딕셔너리든 대응하도록 설계
+            # ⭐ [해결 방법] 어떤 형식으로 반환되든 무조건 '숫자 Loss'만 추출합니다.
             output = policy.forward(batch)
             
             if isinstance(output, (list, tuple)):
-                loss = output  # 첫 번째 원소가 실제 Loss 텐서입니다.
+                loss = output  # (loss, loss_dict) 중 첫 번째가 진짜 loss입니다.
             elif isinstance(output, dict):
-                loss = output["loss"]
+                loss = output["loss"] # 딕셔너리일 경우 'loss' 키값을 찾습니다.
             else:
-                loss = output
+                loss = output # 이미 숫자라면 그대로 씁니다.
 
-        # 이제 loss는 순수한 Tensor이므로 정상적으로 나누기(/) 연산이 가능합니다.
+        # 이제 loss는 확실히 숫자 텐서이므로 연산이 가능합니다.
         accelerator.backward(loss)
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
 
-        step_time = time.perf_counter() - t0
-
         if is_main:
+            # ⭐ [오류 해결] 인덱싱을 통해 리스트 인덱스 오류 완벽 차단
             current_lr = optimizer.param_groups["lr"]
-            rec = logger.log(step, loss.item(), current_lr, step_time)
-            pbar.set_postfix(loss=f"{rec['loss']:.4f}", lr=rec['lr'], eta=rec['eta'])
+            
+            # Loss를 숫자로 변환하여 로깅
+            loss_val = loss.item() if hasattr(loss, "item") else float(loss)
+            rec = logger.log(step, loss_val, current_lr, time.perf_counter() - t0)
+            pbar.set_postfix(loss=f"{rec['loss']:.4f}", lr=rec['lr'])
             pbar.update(1)
 
         if step % args.save_freq == 0:
@@ -179,7 +181,9 @@ def main():
                 accelerator.unwrap_model(policy).save_pretrained(str(ckpt / "policy"))
                 print(f"\n  💾 저장 완료: {ckpt}")
 
-    if is_main: print("\n🎉 모든 에러를 극복하고 학습을 시작했습니다!"); logger.wandb.finish() if args.wandb else None
+    if is_main: 
+        print("\n🎉 모든 고난을 뚫고 학습을 성공적으로 시작했습니다!"); 
+        if args.wandb: logger.wandb.finish()
 
 if __name__ == "__main__":
     main()
