@@ -12,7 +12,6 @@ from pathlib import Path
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 from transformers import AutoTokenizer
 
 
@@ -283,7 +282,6 @@ def main():
     # 3. 학습 루프
     policy.train()
     data_iter = iter(train_loader)
-    pbar = tqdm(total=args.steps, desc="학습", disable=not is_main)
 
     stopped_early = False
 
@@ -315,8 +313,8 @@ def main():
             current_lr = optimizer.param_groups[0]["lr"]
             loss_val = loss.item() if hasattr(loss, "item") else float(loss)
             rec = logger.log_train(step, loss_val, current_lr, time.perf_counter() - t0)
-            pbar.set_postfix(loss=f"{rec['loss']:.4f}", lr=rec['lr'])
-            pbar.update(1)
+            pct = step / args.steps * 100
+            print(f"[step {step:6d}/{args.steps} ({pct:5.1f}%)]  loss={rec['loss']:.5f}  avg={rec['avg_loss']:.5f}  lr={rec['lr']}  eta={rec['eta']}")
 
         # ── Validation & Early Stopping ──────────────────────────────────────
         if step % args.val_freq == 0:
@@ -333,8 +331,8 @@ def main():
                     # best 체크포인트 저장
                     accelerator.unwrap_model(policy).save_pretrained(str(best_ckpt_dir / "policy"))
 
-                pbar.write(
-                    f"  [val step {step:6d}]  val_loss={val_loss:.5f}  "
+                print(
+                    f"  >>> [val step {step:6d}]  val_loss={val_loss:.5f}  "
                     f"best={early_stop.best_loss:.5f}  {status}"
                 )
 
@@ -347,7 +345,7 @@ def main():
             # 모든 프로세스가 stop 플래그 확인
             if (output_dir / ".stop").exists():
                 if is_main:
-                    pbar.write(f"\n  Early stopping! patience {args.patience} 소진 (step {step})")
+                    print(f"\n  Early stopping! patience {args.patience} 소진 (step {step})")
                 stopped_early = True
                 break
 
@@ -361,7 +359,6 @@ def main():
 
     # 4. 마무리
     if is_main:
-        pbar.close()
         # stop 플래그 정리
         stop_flag = output_dir / ".stop"
         if stop_flag.exists():
