@@ -39,6 +39,16 @@ if [ ! -d "LIBERO" ]; then
 fi
 pip install -e LIBERO -q
 
+echo "[4.5/5] 추가 패키지 설치..."
+pip install peft h5py -q
+
+# lerobot exist_ok 버그 패치
+METADATA_PY=$(python -c "import lerobot; import os; print(os.path.join(os.path.dirname(lerobot.__file__), 'datasets/dataset_metadata.py'))" 2>/dev/null)
+if [ -f "$METADATA_PY" ]; then
+    sed -i 's/exist_ok=False/exist_ok=True/' "$METADATA_PY"
+    echo "  lerobot exist_ok 패치 완료: $METADATA_PY"
+fi
+
 echo "[5/5] accelerate 설정..."
 python -c "
 from accelerate.utils import write_basic_config

@@ -105,7 +105,7 @@ def main():
                 print(f"  [{ep_idx+1}/{len(demos)}] {dname} ({T} steps)  "
                       f"task: {task_desc[:50]}")
 
-    dataset.consolidate()
+    dataset.finalize()
     print(f"\n완료: {output_root / args.output_repo}")
 
 
