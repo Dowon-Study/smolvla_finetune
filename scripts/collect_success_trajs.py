@@ -23,7 +23,7 @@ import pathlib
 import sys
 import types as _types
 
-os.environ["MUJOCO_GL"] = "glx"
+os.environ["MUJOCO_GL"] = "egl"
 
 # ------------------------------------------------------------------
 # TF / NumPy 비호환 문제 회피 (datasets import 전에 처리)
