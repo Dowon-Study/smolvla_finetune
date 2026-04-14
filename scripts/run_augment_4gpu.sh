@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# run_augment_4gpu.sh
+# run_augment_4gpu.sh 
 #
 # augment_action_noise.py 를 4-GPU 서버에서 병렬 실행합니다.
 #
