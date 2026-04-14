@@ -64,6 +64,15 @@ import pathlib
 import sys
 import types as _types
 
+# ── GPU 선택: CUDA init 전에 (import torch 전에) 반드시 설정해야 함
+# sys.argv를 직접 파싱해서 --gpu_id 값을 읽음
+_gpu_id_str = "0"
+for _i, _a in enumerate(sys.argv):
+    if _a == "--gpu_id" and _i + 1 < len(sys.argv):
+        _gpu_id_str = sys.argv[_i + 1]
+        break
+os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id_str
+
 # ── 서버 headless 렌더링 (EGL)
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -600,9 +609,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # ── GPU 지정
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
-
+    # CUDA_VISIBLE_DEVICES 는 파일 최상단(import 전)에서 이미 설정됨
     rng = np.random.default_rng(SEED + args.gpu_id * 1000)
     torch.manual_seed(SEED + args.gpu_id)
 
