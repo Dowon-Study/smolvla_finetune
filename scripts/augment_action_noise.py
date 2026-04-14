@@ -19,8 +19,8 @@ SmolVLA 추론 성공 궤적 기반 Action Noise "샌드위치" 데이터 증강
     Aug-2: (s(t+1),    a_rec )  ← 노이즈 상태에서 GT(t+2)로 복구
 
   INCLUDE_ORIGINAL=True (기본값):
-    - 성공한 원본 궤적 에피소드 저장 (ep_idx=0,2,4,...)
-    - 증강 쌍 에피소드 저장           (ep_idx=1,3,5,...)
+    - 성공한 원본 궤적 에피소드 저장
+    - 증강 쌍 에피소드 저장 (별도 episode_index)
   INCLUDE_ORIGINAL=False:
     - 증강 쌍 에피소드만 저장
 
@@ -35,15 +35,28 @@ SmolVLA 추론 성공 궤적 기반 Action Noise "샌드위치" 데이터 증강
   각 성공 에피소드에서 EEF 이동량 / action 값으로 실험적 추정
   (fallback: DEFAULT_POS_SCALE=0.05 m, DEFAULT_ROT_SCALE=0.15 rad)
 
-【서버 환경】
+【서버 환경 (멀티 GPU)】
   MUJOCO_GL=egl  (헤드리스, 디스플레이 불필요)
-  단일 GPU 순차 처리
+  --gpu_id 인자로 담당 GPU를 지정합니다.
+  run_augment_4gpu.sh 가 4개 프로세스를 병렬 실행하며 task를 분배합니다.
 
-실행:
+  GPU 0 → tasks  0- 9  (libero_10)
+  GPU 1 → tasks 10-19  (libero_goal)
+  GPU 2 → tasks 20-29  (libero_object)
+  GPU 3 → tasks 30-39  (libero_spatial)
+
+  각 GPU는 동일한 출력 디렉터리에 비중첩 episode_index / frame index로 씁니다.
+  ep_offset / frame_offset 은 run_augment_4gpu.sh 가 미리 계산하여 전달합니다.
+
+단독 실행 (단일 GPU):
   /media/idna/Data/envs/smolvla/bin/python augment_action_noise.py
+
+4-GPU 병렬 실행:
+  bash run_augment_4gpu.sh
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
+import argparse
 import copy
 import json
 import os
@@ -566,48 +579,72 @@ def write_info_json(out_root: pathlib.Path, total_episodes: int, total_frames: i
 # 메인
 # ============================================================
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Action Noise 샌드위치 데이터 증강")
+    p.add_argument("--gpu_id",      type=int, default=0,
+                   help="사용할 GPU 번호 (CUDA_VISIBLE_DEVICES 설정)")
+    p.add_argument("--task_start",  type=int, default=0,
+                   help="담당 task_index 시작 (inclusive)")
+    p.add_argument("--task_end",    type=int, default=40,
+                   help="담당 task_index 끝 (exclusive)")
+    p.add_argument("--ep_offset",   type=int, default=0,
+                   help="전체 episode_index 시작 오프셋 (GPU 간 비중첩 보장)")
+    p.add_argument("--frame_offset",type=int, default=0,
+                   help="전체 frame index 시작 오프셋 (GPU 간 비중첩 보장)")
+    return p.parse_args()
+
+
 def main():
-    rng = np.random.default_rng(SEED)
-    torch.manual_seed(SEED)
+    args = parse_args()
+
+    # ── GPU 지정
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+
+    rng = np.random.default_rng(SEED + args.gpu_id * 1000)
+    torch.manual_seed(SEED + args.gpu_id)
+
+    task_range = list(range(args.task_start, args.task_end))
 
     data_dir = OUTPUT_BASE / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"\n[GPU {args.gpu_id}] tasks {args.task_start}-{args.task_end - 1}"
+          f"  ep_offset={args.ep_offset}  frame_offset={args.frame_offset}")
+
     # ── 모델 로드
-    print(f"[1/2] 모델 로딩: {MODEL_ID}")
+    print(f"[GPU {args.gpu_id}][1/2] 모델 로딩: {MODEL_ID}")
     policy = SmolVLAPolicy.from_pretrained(MODEL_ID)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     policy = policy.to(device).eval()
-    print(f"      device={device}  chunk_size={policy.config.chunk_size}")
+    print(f"[GPU {args.gpu_id}]      device={device}  chunk_size={policy.config.chunk_size}")
 
     pre, post = make_pre_post_processors(policy.config, MODEL_ID)
     env_pre   = PolicyProcessorPipeline(steps=[LiberoProcessorStep()])
 
-    print(f"\n  노이즈 설정: σ={NOISE_STD:.3f}  (range={ACTION_RANGE}의 {NOISE_RATIO*100:.0f}%)")
-    print(f"  INCLUDE_ORIGINAL={INCLUDE_ORIGINAL}\n")
+    print(f"[GPU {args.gpu_id}]  σ={NOISE_STD:.3f}  INCLUDE_ORIGINAL={INCLUDE_ORIGINAL}")
 
     # ── 수집 + 증강
-    print(f"[2/2] 수집 및 증강 시작 (task 0-39)")
-    global_ep_idx    = 0
-    global_frame_idx = 0
+    print(f"[GPU {args.gpu_id}][2/2] 수집 및 증강 시작")
+    global_ep_idx    = args.ep_offset
+    global_frame_idx = args.frame_offset
     total_frames     = 0
     summary          = []
 
-    for task_idx in range(40):
+    for task_idx in task_range:
         suite_name, task_id = TASK_MAP[task_idx]
         max_steps           = MAX_STEPS_MAP[task_idx]
 
-        print(f"\n{'─'*64}")
-        print(f"  task {task_idx:2d}  {suite_name}/{task_id}")
+        print(f"\n[GPU {args.gpu_id}] {'─'*56}")
+        print(f"[GPU {args.gpu_id}]  task {task_idx:2d}  {suite_name}/{task_id}")
 
-        env, task_desc, init_states = make_env(suite_name, task_id, SEED)
-        print(f"  {task_desc[:72]}")
+        env, task_desc, init_states = make_env(suite_name, task_id, SEED + args.gpu_id)
+        print(f"[GPU {args.gpu_id}]  {task_desc[:68]}")
 
         collected   = 0
         attempt     = 0
         task_frames = 0
 
-        pbar = tqdm.tqdm(total=N_SUCCESS, desc=f"  task{task_idx:2d}", unit="ep")
+        pbar = tqdm.tqdm(total=N_SUCCESS, desc=f"[GPU{args.gpu_id}] task{task_idx:2d}", unit="ep")
 
         while collected < N_SUCCESS and attempt < MAX_ATTEMPTS:
             init_state = init_states[attempt % len(init_states)].copy()
@@ -674,7 +711,7 @@ def main():
         env.close()
 
         status = "✓" if collected >= N_SUCCESS else f"✗({collected}/{N_SUCCESS})"
-        print(f"  → {status}  시도:{attempt}  수집:{collected}  프레임:{task_frames:,}")
+        print(f"[GPU {args.gpu_id}]  → {status}  시도:{attempt}  수집:{collected}  프레임:{task_frames:,}")
 
         summary.append({
             "task_index":  task_idx,
@@ -686,27 +723,25 @@ def main():
             "frames":      task_frames,
         })
 
-    # ── 메타데이터
-    total_episodes = global_ep_idx
-    write_info_json(OUTPUT_BASE, total_episodes, total_frames)
-
-    summary_path = OUTPUT_BASE / "summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
+    # ── GPU별 부분 결과 저장 (나중에 run_augment_4gpu.sh 가 병합)
+    partial_path = OUTPUT_BASE / f"partial_gpu{args.gpu_id}.json"
+    with open(partial_path, "w", encoding="utf-8") as f:
         json.dump({
-            "total_episodes": total_episodes,
-            "total_frames":   total_frames,
-            "noise_std":      float(NOISE_STD),
-            "include_original": INCLUDE_ORIGINAL,
-            "tasks": summary,
+            "gpu_id":        args.gpu_id,
+            "task_start":    args.task_start,
+            "task_end":      args.task_end,
+            "ep_offset":     args.ep_offset,
+            "ep_end":        global_ep_idx,
+            "frame_offset":  args.frame_offset,
+            "frame_end":     global_frame_idx,
+            "total_frames":  total_frames,
+            "tasks":         summary,
         }, f, indent=2, ensure_ascii=False)
 
-    print(f"\n{'='*64}")
-    print(f"  완료")
-    print(f"  저장 경로  : {OUTPUT_BASE}")
-    print(f"  총 에피소드: {total_episodes:,}")
-    print(f"  총 프레임  : {total_frames:,}")
-    print(f"  요약 파일  : {summary_path}")
-    print(f"{'='*64}")
+    print(f"\n[GPU {args.gpu_id}] {'='*56}")
+    print(f"[GPU {args.gpu_id}]  완료  frames={total_frames:,}  eps={global_ep_idx - args.ep_offset}")
+    print(f"[GPU {args.gpu_id}]  부분 결과: {partial_path}")
+    print(f"[GPU {args.gpu_id}] {'='*56}")
 
 
 if __name__ == "__main__":
