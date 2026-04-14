@@ -26,8 +26,13 @@
 set -e
 cd "$(dirname "$0")"
 
-PYTHON=/media/idna/Data/envs/smolvla/bin/python
+PYTHON=/home/bigcom/anaconda3/envs/smolvla/bin/python
 OUT_DIR=./outputs/augmented_action_noise
+
+# ── HuggingFace 캐시를 서버 로컬 경로로 고정 (로컬 머신 경로 무시)
+export HF_HOME="${HOME}/.cache/huggingface"
+export HF_DATASETS_CACHE="${HOME}/.cache/huggingface/datasets"
+export HUGGINGFACE_HUB_CACHE="${HOME}/.cache/huggingface/hub"
 
 # ── 오프셋 설정 (GPU 당 여유 있게 잡음)
 MAX_EP_PER_GPU=200       # N_SUCCESS(10) × 10tasks × 2(orig+aug) = 200
