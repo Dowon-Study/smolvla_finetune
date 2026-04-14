@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# run_augment_4gpu.sh 
+# run_augment_4gpu.sh
 #
 # augment_action_noise.py 를 4-GPU 서버에서 병렬 실행합니다.
 #
@@ -63,25 +63,26 @@ mkdir -p "${OUT_DIR}/data"
 mkdir -p "${OUT_DIR}/logs"
 
 # ── 4개 프로세스 병렬 실행
-$PYTHON augment_action_noise.py \
+# CUDA_VISIBLE_DEVICES 를 프로세스 환경에 직접 주입 (Python import 전 적용 보장)
+CUDA_VISIBLE_DEVICES=0 $PYTHON augment_action_noise.py \
     --gpu_id 0 --task_start 0  --task_end 10 \
     --ep_offset ${EP_OFFSET_0} --frame_offset ${FR_OFFSET_0} \
     > "${OUT_DIR}/logs/gpu0.log" 2>&1 &
 PID0=$!
 
-$PYTHON augment_action_noise.py \
+CUDA_VISIBLE_DEVICES=1 $PYTHON augment_action_noise.py \
     --gpu_id 1 --task_start 10 --task_end 20 \
     --ep_offset ${EP_OFFSET_1} --frame_offset ${FR_OFFSET_1} \
     > "${OUT_DIR}/logs/gpu1.log" 2>&1 &
 PID1=$!
 
-$PYTHON augment_action_noise.py \
+CUDA_VISIBLE_DEVICES=2 $PYTHON augment_action_noise.py \
     --gpu_id 2 --task_start 20 --task_end 30 \
     --ep_offset ${EP_OFFSET_2} --frame_offset ${FR_OFFSET_2} \
     > "${OUT_DIR}/logs/gpu2.log" 2>&1 &
 PID2=$!
 
-$PYTHON augment_action_noise.py \
+CUDA_VISIBLE_DEVICES=3 $PYTHON augment_action_noise.py \
     --gpu_id 3 --task_start 30 --task_end 40 \
     --ep_offset ${EP_OFFSET_3} --frame_offset ${FR_OFFSET_3} \
     > "${OUT_DIR}/logs/gpu3.log" 2>&1 &
